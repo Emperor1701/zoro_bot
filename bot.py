@@ -1,5 +1,4 @@
 import os
-import sqlite3
 from datetime import datetime, timezone, timedelta
 from io import BytesIO
 
@@ -25,70 +24,82 @@ from telegram.ext import (
     filters,
 )
 
+from psycopg_pool import ConnectionPool
+
+
 # =========================
 # إعدادات أساسية
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNER_ID = int(os.getenv("OWNER_ID", "0").strip())
-DB_PATH = os.getenv("DB_PATH", "members.db").strip()
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# ساعة الفحص اليومي (UTC)
 DAILY_CHECK_HOUR_UTC = int(os.getenv("DAILY_CHECK_HOUR_UTC", "9"))
-
-# مراحل التنبيه للمالك
 WARN_STAGES_OWNER = [7, 3, 1]
-
-# تقطيع المنشنات بالكروب لتفادي طول الرسالة
 GROUP_MENTION_CHUNK_SIZE = 30
 
-if not BOT_TOKEN or OWNER_ID == 0:
-    raise SystemExit("Please set BOT_TOKEN and OWNER_ID environment variables.")
+KING_USERNAME = "@Al_K_i_n_g"
+
+if not BOT_TOKEN or OWNER_ID == 0 or not DATABASE_URL:
+    raise SystemExit("Missing env vars. Please set BOT_TOKEN, OWNER_ID, DATABASE_URL.")
+
 
 # =========================
-# قاعدة البيانات + الإعدادات
+# اتصال PostgreSQL (Pool)
 # =========================
-def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS members (
-        user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
-        joined_at TEXT,
-        expires_at TEXT,
-        warn_stage_sent INTEGER  -- NULL أو 7 أو 3 أو 1 (آخر مرحلة تنبيه تم إرسالها)
-    )
-    """)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_expires_at ON members(expires_at)")
+pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, open=True)
 
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT
-    )
-    """)
 
-    # افتراضيات
-    conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('default_duration_months', '3')")
-    conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('notify_group_chat_id', '')")
-    conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('group_notify_enabled', '0')")
-    conn.execute("INSERT OR IGNORE INTO settings(key, value) VALUES ('group_notify_stages', '7')")  # افتراضي: 7 فقط
+def init_db():
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS members (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                full_name TEXT,
+                joined_at TIMESTAMPTZ NOT NULL,
+                expires_at TIMESTAMPTZ NOT NULL,
+                warn_stage_sent INTEGER
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_members_expires_at ON members (expires_at);")
 
-    return conn
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            """)
+
+            # افتراضيات
+            cur.execute("""
+            INSERT INTO settings(key, value) VALUES
+                ('default_duration_months', '3'),
+                ('notify_group_chat_id', ''),
+                ('group_notify_enabled', '0'),
+                ('group_notify_stages', '7')
+            ON CONFLICT (key) DO NOTHING;
+            """)
+        conn.commit()
 
 
 def get_setting(key: str, default: str = "") -> str:
-    with db() as conn:
-        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-        return row[0] if row and row[0] is not None else default
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM settings WHERE key=%s", (key,))
+            row = cur.fetchone()
+            return row[0] if row and row[0] is not None else default
 
 
 def set_setting(key: str, value: str):
-    with db() as conn:
-        conn.execute("""
-        INSERT INTO settings(key, value) VALUES(?, ?)
-        ON CONFLICT(key) DO UPDATE SET value=excluded.value
-        """, (key, value))
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO settings(key, value) VALUES(%s, %s)
+            ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value
+            """, (key, value))
+        conn.commit()
 
 
 def get_default_months() -> int:
@@ -104,93 +115,103 @@ def compute_expiry(joined_at: datetime) -> datetime:
 
 def upsert_member(user_id: int, username: str, full_name: str, joined_at: datetime):
     expires = compute_expiry(joined_at)
-    with db() as conn:
-        conn.execute(
-            """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
             INSERT INTO members(user_id, username, full_name, joined_at, expires_at, warn_stage_sent)
-            VALUES (?, ?, ?, ?, ?, NULL)
-            ON CONFLICT(user_id) DO UPDATE SET
-                username=excluded.username,
-                full_name=excluded.full_name,
-                joined_at=excluded.joined_at,
-                expires_at=excluded.expires_at,
+            VALUES (%s, %s, %s, %s, %s, NULL)
+            ON CONFLICT (user_id) DO UPDATE SET
+                username=EXCLUDED.username,
+                full_name=EXCLUDED.full_name,
+                joined_at=EXCLUDED.joined_at,
+                expires_at=EXCLUDED.expires_at,
                 warn_stage_sent=NULL
-            """,
-            (user_id, username or "", full_name or "", joined_at.isoformat(), expires.isoformat()),
-        )
+            """, (user_id, username or "", full_name or "", joined_at, expires))
+        conn.commit()
 
 
-def get_counts():
-    with db() as conn:
-        return conn.execute("SELECT COUNT(*) FROM members").fetchone()[0]
+def get_counts() -> int:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM members")
+            return int(cur.fetchone()[0])
 
 
 def fetch_all():
-    with db() as conn:
-        return conn.execute(
-            "SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent "
-            "FROM members ORDER BY datetime(joined_at) DESC"
-        ).fetchall()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent
+            FROM members
+            ORDER BY joined_at DESC
+            """)
+            return cur.fetchall()
 
 
 def fetch_expired(now: datetime):
-    with db() as conn:
-        return conn.execute(
-            """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
             SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent
             FROM members
-            WHERE datetime(expires_at) < datetime(?)
-            ORDER BY datetime(expires_at) ASC
-            """,
-            (now.isoformat(),),
-        ).fetchall()
+            WHERE expires_at < %s
+            ORDER BY expires_at ASC
+            """, (now,))
+            return cur.fetchall()
 
 
 def fetch_expiring_within(now: datetime, days: int):
     end = now + timedelta(days=days)
-    with db() as conn:
-        return conn.execute(
-            """
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
             SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent
             FROM members
-            WHERE datetime(expires_at) >= datetime(?) AND datetime(expires_at) <= datetime(?)
-            ORDER BY datetime(expires_at) ASC
-            """,
-            (now.isoformat(), end.isoformat()),
-        ).fetchall()
+            WHERE expires_at >= %s AND expires_at <= %s
+            ORDER BY expires_at ASC
+            """, (now, end))
+            return cur.fetchall()
 
 
 def find_member(query: str):
-    with db() as conn:
-        if query.isdigit():
-            return conn.execute(
-                "SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent FROM members WHERE user_id=?",
-                (int(query),),
-            ).fetchone()
-        q = query.lstrip("@")
-        return conn.execute(
-            "SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent FROM members WHERE lower(username)=lower(?)",
-            (q,),
-        ).fetchone()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            if query.isdigit():
+                cur.execute("""
+                SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent
+                FROM members WHERE user_id=%s
+                """, (int(query),))
+                return cur.fetchone()
+
+            q = query.lstrip("@")
+            cur.execute("""
+            SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent
+            FROM members WHERE lower(username)=lower(%s)
+            """, (q,))
+            return cur.fetchone()
 
 
 def extend_member_days(user_id: int, days: int) -> bool:
-    with db() as conn:
-        row = conn.execute("SELECT expires_at FROM members WHERE user_id=?", (user_id,)).fetchone()
-        if not row:
-            return False
-        old_exp = datetime.fromisoformat(row[0])
-        new_exp = old_exp + timedelta(days=days)
-        conn.execute(
-            "UPDATE members SET expires_at=?, warn_stage_sent=NULL WHERE user_id=?",
-            (new_exp.isoformat(), user_id),
-        )
-        return True
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT expires_at FROM members WHERE user_id=%s", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            old_exp = row[0]
+            new_exp = old_exp + timedelta(days=days)
+            cur.execute("""
+            UPDATE members SET expires_at=%s, warn_stage_sent=NULL WHERE user_id=%s
+            """, (new_exp, user_id))
+        conn.commit()
+    return True
 
 
 def set_warn_stage(user_id: int, stage: int | None):
-    with db() as conn:
-        conn.execute("UPDATE members SET warn_stage_sent=? WHERE user_id=?", (stage, user_id))
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE members SET warn_stage_sent=%s WHERE user_id=%s", (stage, user_id))
+        conn.commit()
 
 
 # =========================
@@ -264,9 +285,6 @@ def duration_menu():
 
 def group_menu():
     enabled = get_setting("group_notify_enabled", "0") == "1"
-    stages = get_setting("group_notify_stages", "7").strip() or "7"
-    gid = get_setting("notify_group_chat_id", "").strip()
-
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ تفعيل" if not enabled else "⛔ إيقاف", callback_data="toggle_group_notify")],
         [InlineKeyboardButton("مراحل: 7 فقط", callback_data="set_group_stages_7")],
@@ -283,7 +301,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# حفظ الكروب للتنبيهات: /setgroup (داخل الكروب)
+# /setgroup داخل الكروب
 # =========================
 async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
@@ -296,14 +314,15 @@ async def setgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     set_setting("notify_group_chat_id", str(chat.id))
     await update.message.reply_text("✅ تم حفظ هذا الكروب لإرسال تنبيهات الاشتراك.")
-    # (اختياري) تفعيل التنبيه فورًا
+
+    # تفعيل تلقائي
     if get_setting("group_notify_enabled", "0") != "1":
         set_setting("group_notify_enabled", "1")
         await update.message.reply_text("✅ تم تفعيل تنبيه الكروب تلقائيًا.")
 
 
 # =========================
-# تتبع دخول الأعضاء للكروب
+# تتبع دخول الأعضاء
 # =========================
 async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     result = update.chat_member
@@ -326,7 +345,7 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# Excel Export (مع تصفية)
+# Excel Export
 # =========================
 def autosize(ws):
     for col in ws.columns:
@@ -367,10 +386,9 @@ def build_xlsx_bytes(all_rows, expiring_rows, expired_rows):
 
 
 # =========================
-# التنبيهات (7/3/1) + تنبيه الكروب بالمنشن
+# التنبيهات + منشن بالكروب
 # =========================
 def stage_for_remaining_days(remaining_days: int) -> int | None:
-    # الأولوية للأقرب
     if remaining_days <= 1:
         return 1
     if remaining_days <= 3:
@@ -387,14 +405,10 @@ def parse_group_stages() -> set[int]:
     for p in parts:
         if p.isdigit():
             out.add(int(p))
-    # ضمان معقول
-    return out & {7, 3, 1} if out else {7}
+    return (out & {7, 3, 1}) if out else {7}
 
 
 async def notify_group_mentions(context: ContextTypes.DEFAULT_TYPE, stage: int, people):
-    """
-    people: list of tuples (user_id, full_name, expires_iso, remaining_days)
-    """
     enabled = get_setting("group_notify_enabled", "0") == "1"
     gid = get_setting("notify_group_chat_id", "").strip()
     if (not enabled) or (not gid):
@@ -406,20 +420,21 @@ async def notify_group_mentions(context: ContextTypes.DEFAULT_TYPE, stage: int, 
 
     group_id = int(gid)
 
-    # بناء منشنات HTML (حتى بدون username)
     mentions = []
-    for user_id, full_name, _exp_iso, _rem_days in people:
+    for user_id, full_name in people:
         display = full_name if full_name else str(user_id)
         mentions.append(mention_html(user_id, display))
 
-    # نص حسب المرحلة
     title = f"🔔 تنبيه: باقي {stage} أيام على انتهاء الاشتراك"
-    subtitle = "يرجى التجديد لتجنب انتهاء الوصول."
+    subtitle = (
+        "إذا كان لديك أي استفسار أو كنت تريد تجديد اشتراكك\n"
+        f"يرجى مراسلة الكينغ لتجديد الاشتراك: {KING_USERNAME}\n"
+        "وشكرًا."
+    )
 
-    # تقطيع المنشنات لرسائل
     for i in range(0, len(mentions), GROUP_MENTION_CHUNK_SIZE):
         chunk = mentions[i:i + GROUP_MENTION_CHUNK_SIZE]
-        text = title + "\n" + subtitle + "\n\n" + "\n".join(f"• {m}" for m in chunk)
+        text = title + "\n\n" + subtitle + "\n\n" + "\n".join(f"• {m}" for m in chunk)
         await context.bot.send_message(
             chat_id=group_id,
             text=text,
@@ -430,16 +445,12 @@ async def notify_group_mentions(context: ContextTypes.DEFAULT_TYPE, stage: int, 
 
 async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
     now = datetime.now(timezone.utc)
-
-    # نجيب كل اللي ضمن 7 أيام (هذا يشمل 3 و1)
     candidates = fetch_expiring_within(now, 7)
 
     to_notify_owner = {7: [], 3: [], 1: []}
-    to_notify_group = {7: [], 3: [], 1: []}
+    to_notify_group = {7: [], 3: [], 1: []}  # stage -> list[(user_id, full_name)]
 
-    for user_id, username, full_name, _joined_at_s, expires_at_s, warn_stage_sent in candidates:
-        expires_at = datetime.fromisoformat(expires_at_s)
-
+    for user_id, username, full_name, _joined_at, expires_at, warn_stage_sent in candidates:
         remaining_seconds = (expires_at - now).total_seconds()
         remaining_days = int((remaining_seconds + 86399) // 86400)  # ceil
 
@@ -447,8 +458,7 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
         if stage is None:
             continue
 
-        # منع التكرار:
-        # إذا سبق أرسلنا مرحلة أقرب أو نفسها، لا نعيد
+        # منع التكرار (إذا أرسلنا مرحلة أقرب أو نفسها)
         if warn_stage_sent is not None and int(warn_stage_sent) <= stage:
             continue
 
@@ -456,11 +466,10 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
         exp_iso = expires_at.isoformat()
 
         to_notify_owner[stage].append((user_id, full_name, u, exp_iso, remaining_days))
-        to_notify_group[stage].append((user_id, full_name, exp_iso, remaining_days))
+        to_notify_group[stage].append((user_id, full_name))
 
     sent_any = False
 
-    # نرسل للمالك حسب 7/3/1
     for stage in WARN_STAGES_OWNER:
         items = to_notify_owner[stage]
         if not items:
@@ -476,7 +485,7 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
 
         await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
 
-        # إرسال للكروب (حسب الإعدادات)
+        # تنبيه بالكروب حسب الإعدادات
         await notify_group_mentions(context, stage, to_notify_group[stage])
 
         # تعليم المرحلة كمرسلة
@@ -484,7 +493,7 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
             set_warn_stage(user_id, stage)
 
     if manual and not sent_any:
-        await context.bot.send_message(chat_id=OWNER_ID, text="✅ لا يوجد تنبيهات الآن (لا أحد ضمن 7 أيام أو تم التنبيه بالفعل).")
+        await context.bot.send_message(chat_id=OWNER_ID, text="✅ لا يوجد تنبيهات الآن.")
 
 
 async def job_daily_warning(context: ContextTypes.DEFAULT_TYPE):
@@ -516,13 +525,9 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         all_rows = fetch_all()
         expiring = fetch_expiring_within(now, 7)
         expired = fetch_expired(now)
-
         bio = build_xlsx_bytes(all_rows, expiring, expired)
         bio.name = "subscribers.xlsx"
-        await q.message.reply_document(
-            document=InputFile(bio),
-            caption="ملف Excel ✅ (All / Expiring_7_Days / Expired)"
-        )
+        await q.message.reply_document(document=InputFile(bio), caption="ملف Excel ✅ (All / Expiring_7_Days / Expired)")
         return
 
     if data == "ask_search":
@@ -582,7 +587,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(
             "لتحديد الكروب الذي تُرسل إليه التنبيهات:\n"
             "1) أضف البوت كـ Admin بالكروب\n"
-            "2) داخل الكروب اكتب الأمر: /setgroup\n"
+            "2) داخل الكروب اكتب: /setgroup\n"
             "بعدها فعّل تنبيه الكروب من الأزرار إن لزم."
         )
         return
@@ -609,8 +614,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- ID: {user_id}\n"
             f"- Username: {u}\n"
             f"- Name: {full_name}\n"
-            f"- Joined (UTC): {joined_at}\n"
-            f"- Expires (UTC): {expires_at}\n"
+            f"- Joined (UTC): {joined_at.isoformat()}\n"
+            f"- Expires (UTC): {expires_at.isoformat()}\n"
             f"- Warn stage sent: {warn_txt}"
         )
         return
@@ -634,20 +639,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # تشغيل
 # =========================
 def main():
+    init_db()
+
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # لوحة المالك بالخاص
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, on_text))
 
-    # /setgroup داخل الكروب (محمي بالمالك)
     app.add_handler(CommandHandler("setgroup", setgroup))
-
-    # تتبع دخول الأعضاء
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
-    # فحص يومي للتنبيهات
     app.job_queue.run_daily(
         job_daily_warning,
         time=datetime.now(timezone.utc).replace(hour=DAILY_CHECK_HOUR_UTC, minute=0, second=0, microsecond=0).time(),
