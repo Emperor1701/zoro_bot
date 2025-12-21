@@ -26,6 +26,9 @@ from telegram.ext import (
 
 from psycopg_pool import ConnectionPool
 
+# Python 3.9+
+from zoneinfo import ZoneInfo
+
 
 # =========================
 # إعدادات أساسية
@@ -40,8 +43,43 @@ GROUP_MENTION_CHUNK_SIZE = 30
 
 KING_USERNAME = "@Al_K_i_n_g"
 
+# توقيت بلدك (تحدده أنت في Railway Variables)
+LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "UTC").strip()
+
 if not BOT_TOKEN or OWNER_ID == 0 or not DATABASE_URL:
     raise SystemExit("Missing env vars. Please set BOT_TOKEN, OWNER_ID, DATABASE_URL.")
+
+
+def get_tz() -> ZoneInfo:
+    try:
+        return ZoneInfo(LOCAL_TIMEZONE)
+    except Exception:
+        return ZoneInfo("UTC")
+
+
+TZ_LOCAL = get_tz()
+
+
+# =========================
+# أدوات وقت وتنسيق
+# =========================
+def ensure_aware_utc(dt: datetime) -> datetime:
+    """Ensure datetime is timezone-aware UTC."""
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def to_local(dt: datetime) -> datetime:
+    """Convert aware datetime to local timezone (still aware)."""
+    dt = ensure_aware_utc(dt)
+    return dt.astimezone(TZ_LOCAL)
+
+
+def fmt_local(dt: datetime) -> str:
+    """Format datetime in local time as string."""
+    d = to_local(dt)
+    return d.strftime("%Y-%m-%d %H:%M:%S")
 
 
 # =========================
@@ -72,7 +110,6 @@ def init_db():
             );
             """)
 
-            # افتراضيات
             cur.execute("""
             INSERT INTO settings(key, value) VALUES
                 ('default_duration_months', '3'),
@@ -114,6 +151,7 @@ def compute_expiry(joined_at: datetime) -> datetime:
 
 
 def upsert_member(user_id: int, username: str, full_name: str, joined_at: datetime):
+    joined_at = ensure_aware_utc(joined_at)
     expires = compute_expiry(joined_at)
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -149,6 +187,7 @@ def fetch_all():
 
 
 def fetch_expired(now: datetime):
+    now = ensure_aware_utc(now)
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -161,6 +200,7 @@ def fetch_expired(now: datetime):
 
 
 def fetch_expiring_within(now: datetime, days: int):
+    now = ensure_aware_utc(now)
     end = now + timedelta(days=days)
     with pool.connection() as conn:
         with conn.cursor() as cur:
@@ -199,7 +239,7 @@ def extend_member_days(user_id: int, days: int) -> bool:
             if not row:
                 return False
             old_exp = row[0]
-            new_exp = old_exp + timedelta(days=days)
+            new_exp = ensure_aware_utc(old_exp) + timedelta(days=days)
             cur.execute("""
             UPDATE members SET expires_at=%s, warn_stage_sent=NULL WHERE user_id=%s
             """, (new_exp, user_id))
@@ -236,10 +276,14 @@ async def owner_only(update: Update) -> bool:
 
 
 # =========================
-# واجهة الأزرار
+# واجهة “تبويبات” (تعديل نفس رسالة المينيو)
 # =========================
 WAITING_SEARCH = "waiting_search"
 WAITING_EXTEND_ID = "waiting_extend_id"
+
+# نخزن رقم رسالة المينيو بالخاص لكل مالك
+MENU_MESSAGE_ID_KEY = "menu_message_id"
+
 
 def group_notify_status_text() -> str:
     enabled = get_setting("group_notify_enabled", "0") == "1"
@@ -252,14 +296,18 @@ def group_notify_status_text() -> str:
     )
 
 
-def menu_text() -> str:
+def menu_text(extra: str = "") -> str:
     months = get_setting("default_duration_months", "3")
-    return (
+    base = (
         f"لوحة تحكم المالك ✅\n"
         f"مدة الاشتراك الافتراضية: {months} شهر\n"
-        f"{group_notify_status_text()}\n\n"
-        f"اختر إجراء:"
+        f"توقيت العرض: {LOCAL_TIMEZONE}\n"
+        f"{group_notify_status_text()}\n"
     )
+    if extra:
+        base += f"\n—\n{extra}\n"
+    base += "\nاختر إجراء:"
+    return base
 
 
 def main_menu():
@@ -294,10 +342,36 @@ def group_menu():
     ])
 
 
+async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, extra: str = ""):
+    """يرسل/يعدل نفس رسالة المينيو (بدل رسائل كثيرة)."""
+    chat_id = update.effective_chat.id
+    msg_id = context.user_data.get(MENU_MESSAGE_ID_KEY)
+
+    text = menu_text(extra=extra)
+    kb = main_menu()
+
+    # إذا في رسالة مينيو سابقة نحاول نعدلها
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=text,
+                reply_markup=kb,
+            )
+            return
+        except Exception:
+            # إذا فشل التعديل لأي سبب نرسل رسالة جديدة
+            pass
+
+    sent = await context.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    context.user_data[MENU_MESSAGE_ID_KEY] = sent.message_id
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await owner_only(update):
         return
-    await update.message.reply_text(menu_text(), reply_markup=main_menu())
+    await show_menu(update, context)
 
 
 # =========================
@@ -345,7 +419,7 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # =========================
-# Excel Export
+# Excel Export (حل مشكلة TZ + تحويل لتوقيت بلدك)
 # =========================
 def autosize(ws):
     for col in ws.columns:
@@ -357,12 +431,23 @@ def autosize(ws):
         ws.column_dimensions[col_letter].width = min(max_len + 2, 45)
 
 
+def row_for_excel(r):
+    """
+    r = (user_id, username, full_name, joined_at, expires_at, warn_stage_sent)
+    نحول joined/expires إلى نص محلي (بدون tz) حتى Excel ما يرفضه.
+    """
+    user_id, username, full_name, joined_at, expires_at, warn_stage = r
+    joined_s = fmt_local(joined_at)
+    expires_s = fmt_local(expires_at)
+    return [user_id, username, full_name, joined_s, expires_s, warn_stage]
+
+
 def add_sheet(wb: Workbook, title: str, rows):
     ws = wb.create_sheet(title=title)
-    headers = ["user_id", "username", "full_name", "joined_at_utc", "expires_at_utc", "warn_stage_sent"]
+    headers = ["user_id", "username", "full_name", "joined_at_local", "expires_at_local", "warn_stage_sent"]
     ws.append(headers)
     for r in rows:
-        ws.append(list(r))
+        ws.append(row_for_excel(r))
     autosize(ws)
 
 
@@ -370,10 +455,10 @@ def build_xlsx_bytes(all_rows, expiring_rows, expired_rows):
     wb = Workbook()
     ws0 = wb.active
     ws0.title = "All"
-    headers = ["user_id", "username", "full_name", "joined_at_utc", "expires_at_utc", "warn_stage_sent"]
+    headers = ["user_id", "username", "full_name", "joined_at_local", "expires_at_local", "warn_stage_sent"]
     ws0.append(headers)
     for r in all_rows:
-        ws0.append(list(r))
+        ws0.append(row_for_excel(r))
     autosize(ws0)
 
     add_sheet(wb, "Expiring_7_Days", expiring_rows)
@@ -451,7 +536,8 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
     to_notify_group = {7: [], 3: [], 1: []}  # stage -> list[(user_id, full_name)]
 
     for user_id, username, full_name, _joined_at, expires_at, warn_stage_sent in candidates:
-        remaining_seconds = (expires_at - now).total_seconds()
+        expires_at = ensure_aware_utc(expires_at)
+        remaining_seconds = (expires_at - ensure_aware_utc(now)).total_seconds()
         remaining_days = int((remaining_seconds + 86399) // 86400)  # ceil
 
         stage = stage_for_remaining_days(remaining_days)
@@ -463,9 +549,9 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
             continue
 
         u = f"@{username}" if username else "(بدون يوزرنيم)"
-        exp_iso = expires_at.isoformat()
+        exp_local = fmt_local(expires_at)
 
-        to_notify_owner[stage].append((user_id, full_name, u, exp_iso, remaining_days))
+        to_notify_owner[stage].append((user_id, full_name, u, exp_local, remaining_days))
         to_notify_group[stage].append((user_id, full_name))
 
     sent_any = False
@@ -476,9 +562,9 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
             continue
 
         sent_any = True
-        lines = [f"🔔 تنبيه قبل {stage} أيام (UTC)", ""]
-        for user_id, full_name, u, exp_iso, remaining_days in items[:60]:
-            lines.append(f"- {full_name} | {u} | ID: {user_id} | ينتهي: {exp_iso} | باقي: {remaining_days} يوم")
+        lines = [f"🔔 تنبيه قبل {stage} أيام (توقيتك: {LOCAL_TIMEZONE})", ""]
+        for user_id, full_name, u, exp_local, remaining_days in items[:60]:
+            lines.append(f"- {full_name} | {u} | ID: {user_id} | ينتهي: {exp_local} | باقي: {remaining_days} يوم")
         if len(items) > 60:
             lines.append("")
             lines.append(f"… ويوجد {len(items) - 60} آخرين (صدّر Excel لرؤية الجميع).")
@@ -512,83 +598,134 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     data = q.data
 
+    # رجوع للمينيو
     if data == "back_main":
-        await q.message.reply_text(menu_text(), reply_markup=main_menu())
+        # تعديل نفس الرسالة
+        try:
+            await q.message.edit_text(menu_text(), reply_markup=main_menu())
+        except Exception:
+            pass
         return
 
+    # عدد المشتركين (نحدّث نفس المينيو بآخر نتيجة)
     if data == "count":
-        await q.message.reply_text(f"عدد المشتركين المسجّلين: {get_counts()}")
+        c = get_counts()
+        try:
+            await q.message.edit_text(menu_text(extra=f"📊 عدد المشتركين: {c}"), reply_markup=main_menu())
+        except Exception:
+            await context.bot.send_message(chat_id=OWNER_ID, text=f"📊 عدد المشتركين: {c}")
         return
 
+    # تصدير Excel
     if data == "export_xlsx":
         now = datetime.now(timezone.utc)
         all_rows = fetch_all()
         expiring = fetch_expiring_within(now, 7)
         expired = fetch_expired(now)
+
         bio = build_xlsx_bytes(all_rows, expiring, expired)
         bio.name = "subscribers.xlsx"
-        await q.message.reply_document(document=InputFile(bio), caption="ملف Excel ✅ (All / Expiring_7_Days / Expired)")
+        await context.bot.send_document(chat_id=OWNER_ID, document=InputFile(bio),
+                                       caption="ملف Excel ✅ (All / Expiring_7_Days / Expired)")
+        # تحديث المينيو بدل رسائل كثيرة
+        try:
+            await q.message.edit_text(menu_text(extra="🧾 تم إرسال ملف Excel بالخاص ✅"), reply_markup=main_menu())
+        except Exception:
+            pass
         return
 
+    # بحث
     if data == "ask_search":
         context.user_data[WAITING_SEARCH] = True
-        await q.message.reply_text("أرسل رقم الـID أو اليوزرنيم (مثال: 123456 أو @username).")
+        await context.bot.send_message(chat_id=OWNER_ID, text="أرسل رقم الـID أو اليوزرنيم (مثال: 123456 أو @username).")
+        try:
+            await q.message.edit_text(menu_text(extra="🔎 بانتظار إدخال البحث…"), reply_markup=main_menu())
+        except Exception:
+            pass
         return
 
+    # تمديد 90 يوم
     if data == "ask_extend_90":
         context.user_data[WAITING_EXTEND_ID] = True
-        await q.message.reply_text("أرسل رقم ID للمشترك لتمديده +90 يوم (3 شهور).")
+        await context.bot.send_message(chat_id=OWNER_ID, text="أرسل رقم ID للمشترك لتمديده +90 يوم (3 شهور).")
+        try:
+            await q.message.edit_text(menu_text(extra="➕ بانتظار ID للتمديد…"), reply_markup=main_menu())
+        except Exception:
+            pass
         return
 
+    # فحص التنبيه الآن
     if data == "run_warn_now":
-        await q.message.reply_text("✅ سأفحص التنبيهات الآن…")
         await run_warning_check(context, manual=True)
+        try:
+            await q.message.edit_text(menu_text(extra="🔔 تم تنفيذ الفحص الآن ✅"), reply_markup=main_menu())
+        except Exception:
+            pass
         return
 
+    # قائمة مدة الاشتراك
     if data == "duration_menu":
-        await q.message.reply_text("اختر مدة الاشتراك الافتراضية للأعضاء الجدد:", reply_markup=duration_menu())
+        try:
+            await q.message.edit_text("اختر مدة الاشتراك الافتراضية للأعضاء الجدد:", reply_markup=duration_menu())
+        except Exception:
+            pass
         return
 
     if data.startswith("set_duration_"):
         months = data.split("_")[-1]
         if months not in ("1", "3", "12"):
-            await q.message.reply_text("قيمة غير صالحة.")
+            await context.bot.send_message(chat_id=OWNER_ID, text="قيمة غير صالحة.")
             return
         set_setting("default_duration_months", months)
-        await q.message.reply_text(f"✅ تم تعيين المدة الافتراضية إلى: {months} شهر")
-        await q.message.reply_text(menu_text(), reply_markup=main_menu())
+        try:
+            await q.message.edit_text(menu_text(extra=f"⏳ تم ضبط المدة الافتراضية إلى: {months} شهر ✅"), reply_markup=main_menu())
+        except Exception:
+            pass
         return
 
+    # إعدادات تنبيه الكروب
     if data == "group_menu":
-        await q.message.reply_text(group_notify_status_text(), reply_markup=group_menu())
+        try:
+            await q.message.edit_text(group_notify_status_text(), reply_markup=group_menu())
+        except Exception:
+            pass
         return
 
     if data == "toggle_group_notify":
         cur = get_setting("group_notify_enabled", "0")
         newv = "0" if cur == "1" else "1"
         set_setting("group_notify_enabled", newv)
-        await q.message.reply_text("✅ تم تحديث حالة تنبيه الكروب.")
-        await q.message.reply_text(group_notify_status_text(), reply_markup=group_menu())
+        try:
+            await q.message.edit_text(group_notify_status_text(), reply_markup=group_menu())
+        except Exception:
+            pass
         return
 
     if data == "set_group_stages_7":
         set_setting("group_notify_stages", "7")
-        await q.message.reply_text("✅ تم ضبط مراحل تنبيه الكروب إلى: 7 فقط")
-        await q.message.reply_text(group_notify_status_text(), reply_markup=group_menu())
+        try:
+            await q.message.edit_text(group_notify_status_text(), reply_markup=group_menu())
+        except Exception:
+            pass
         return
 
     if data == "set_group_stages_7_3_1":
         set_setting("group_notify_stages", "7,3,1")
-        await q.message.reply_text("✅ تم ضبط مراحل تنبيه الكروب إلى: 7 + 3 + 1")
-        await q.message.reply_text(group_notify_status_text(), reply_markup=group_menu())
+        try:
+            await q.message.edit_text(group_notify_status_text(), reply_markup=group_menu())
+        except Exception:
+            pass
         return
 
     if data == "how_setgroup":
-        await q.message.reply_text(
-            "لتحديد الكروب الذي تُرسل إليه التنبيهات:\n"
-            "1) أضف البوت كـ Admin بالكروب\n"
-            "2) داخل الكروب اكتب: /setgroup\n"
-            "بعدها فعّل تنبيه الكروب من الأزرار إن لزم."
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                "لتحديد الكروب الذي تُرسل إليه التنبيهات:\n"
+                "1) أضف البوت كـ Admin بالكروب\n"
+                "2) داخل الكروب اكتب: /setgroup\n"
+                "بعدها فعّل تنبيه الكروب من الأزرار إن لزم."
+            )
         )
         return
 
@@ -599,40 +736,44 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = (update.message.text or "").strip()
 
+    # بحث
     if context.user_data.get(WAITING_SEARCH):
         context.user_data[WAITING_SEARCH] = False
         row = find_member(text)
         if not row:
-            await update.message.reply_text("لم يتم العثور على هذا المشترك.")
+            await context.bot.send_message(chat_id=OWNER_ID, text="لم يتم العثور على هذا المشترك.")
             return
 
         user_id, username, full_name, joined_at, expires_at, warn_stage = row
         u = f"@{username}" if username else "(لا يوجد)"
         warn_txt = str(warn_stage) if warn_stage is not None else "None"
-        await update.message.reply_text(
+        msg = (
             "✅ بيانات المشترك:\n"
             f"- ID: {user_id}\n"
             f"- Username: {u}\n"
             f"- Name: {full_name}\n"
-            f"- Joined (UTC): {joined_at.isoformat()}\n"
-            f"- Expires (UTC): {expires_at.isoformat()}\n"
+            f"- Joined: {fmt_local(joined_at)} ({LOCAL_TIMEZONE})\n"
+            f"- Expires: {fmt_local(expires_at)} ({LOCAL_TIMEZONE})\n"
             f"- Warn stage sent: {warn_txt}"
         )
+        await context.bot.send_message(chat_id=OWNER_ID, text=msg)
         return
 
+    # تمديد 90 يوم
     if context.user_data.get(WAITING_EXTEND_ID):
         context.user_data[WAITING_EXTEND_ID] = False
         if not text.isdigit():
-            await update.message.reply_text("أرسل رقم ID فقط.")
+            await context.bot.send_message(chat_id=OWNER_ID, text="أرسل رقم ID فقط.")
             return
         ok = extend_member_days(int(text), 90)
         if not ok:
-            await update.message.reply_text("هذا الـID غير موجود في قاعدة البيانات.")
+            await context.bot.send_message(chat_id=OWNER_ID, text="هذا الـID غير موجود في قاعدة البيانات.")
             return
-        await update.message.reply_text("✅ تم التمديد +90 يوم (3 شهور).")
+        await context.bot.send_message(chat_id=OWNER_ID, text="✅ تم التمديد +90 يوم (3 شهور).")
         return
 
-    await update.message.reply_text("اكتب /start لفتح لوحة التحكم.", reply_markup=main_menu())
+    # أي نص آخر
+    await context.bot.send_message(chat_id=OWNER_ID, text="اكتب /start لعرض لوحة التحكم.")
 
 
 # =========================
@@ -643,13 +784,18 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # لوحة المالك بالخاص
     app.add_handler(CommandHandler("start", start, filters=filters.ChatType.PRIVATE))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & filters.ChatType.PRIVATE, on_text))
 
+    # /setgroup داخل الكروب
     app.add_handler(CommandHandler("setgroup", setgroup))
+
+    # تتبع دخول الأعضاء
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
 
+    # فحص يومي للتنبيهات
     app.job_queue.run_daily(
         job_daily_warning,
         time=datetime.now(timezone.utc).replace(hour=DAILY_CHECK_HOUR_UTC, minute=0, second=0, microsecond=0).time(),
