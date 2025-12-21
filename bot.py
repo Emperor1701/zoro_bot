@@ -657,53 +657,6 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
-    # ينتظر مزامنة حالة عضو (زر 🔄)
-if context.user_data.get(WAITING_SYNC):
-    context.user_data[WAITING_SYNC] = False
-
-    if not text.isdigit():
-        await update.message.reply_text("أرسل رقم ID فقط.", reply_markup=kb_main())
-        return
-
-    gid = get_setting("notify_group_chat_id", "").strip()
-    if not gid:
-        await update.message.reply_text(
-            "ما في كروب محفوظ. نفّذ /setgroup داخل الكروب أولًا.",
-            reply_markup=kb_main()
-        )
-        return
-
-    group_id = int(gid)
-    user_id = int(text)
-
-    try:
-        cm = await context.bot.get_chat_member(chat_id=group_id, user_id=user_id)
-        status = cm.status  # member / administrator / restricted / left / kicked
-
-        if status in ("left", "kicked"):
-            mark_member_left(user_id, datetime.now(timezone.utc))
-            await update.message.reply_text(
-                f"✅ تم ضبط العضو كـ Removed (status={status}).",
-                reply_markup=kb_main()
-            )
-        else:
-            mark_member_active(user_id)
-            await update.message.reply_text(
-                f"✅ تم ضبط العضو كـ Active (status={status}).",
-                reply_markup=kb_main()
-            )
-
-    except Exception as e:
-        await update.message.reply_text(
-            "تعذّر فحص العضو.\n"
-            "تأكد من:\n"
-            "- البوت Admin بالكروب\n"
-            "- نفذت /setgroup\n"
-            "- الـID صحيح",
-            reply_markup=kb_main()
-        )
-
-    return
 
     # ينتظر بحث
     if context.user_data.get(WAITING_SEARCH):
@@ -743,6 +696,45 @@ if context.user_data.get(WAITING_SYNC):
         await update.message.reply_text("✅ تم التمديد +90 يوم (3 شهور).", reply_markup=kb_main())
         return
 
+    # ينتظر مزامنة حالة عضو
+    if context.user_data.get(WAITING_SYNC):
+        context.user_data[WAITING_SYNC] = False
+
+        if not text.isdigit():
+            await update.message.reply_text("أرسل رقم ID فقط.", reply_markup=kb_main())
+            return
+
+        gid = get_setting("notify_group_chat_id", "").strip()
+        if not gid:
+            await update.message.reply_text("ما في كروب محفوظ. نفّذ /setgroup داخل الكروب أولًا.", reply_markup=kb_main())
+            return
+
+        group_id = int(gid)
+        user_id = int(text)
+
+        try:
+            cm = await context.bot.get_chat_member(chat_id=group_id, user_id=user_id)
+            status = cm.status
+
+            if status in ("left", "kicked"):
+                mark_member_left(user_id, datetime.now(timezone.utc))
+                await update.message.reply_text(f"✅ تم ضبط العضو كـ Removed (status={status}).", reply_markup=kb_main())
+            else:
+                mark_member_active(user_id)
+                await update.message.reply_text(f"✅ تم ضبط العضو كـ Active (status={status}).", reply_markup=kb_main())
+
+        except Exception:
+            await update.message.reply_text(
+                "تعذّر فحص العضو.\n"
+                "تأكد من:\n"
+                "- البوت Admin بالكروب\n"
+                "- نفذت /setgroup\n"
+                "- الـID صحيح",
+                reply_markup=kb_main()
+            )
+
+        return
+
     state = context.user_data.get(STATE_KEY, STATE_MAIN)
 
     # رجوع
@@ -769,15 +761,6 @@ if context.user_data.get(WAITING_SYNC):
             await update.message.reply_document(document=InputFile(bio), caption="ملف Excel ✅", reply_markup=kb_main())
             return
 
-        if text == TXT_SYNC:
-            context.user_data[WAITING_SYNC] = True
-            await update.message.reply_text(
-                "أرسل رقم ID للعضو لمزامنة حالته مع الكروب (Active / Removed).",
-                reply_markup=kb_main()
-            )
-            return
-
-
         if text == TXT_SEARCH:
             context.user_data[WAITING_SEARCH] = True
             await update.message.reply_text("أرسل رقم الـID أو اليوزرنيم (مثال: 123456 أو @username).", reply_markup=kb_main())
@@ -786,6 +769,11 @@ if context.user_data.get(WAITING_SYNC):
         if text == TXT_EXTEND:
             context.user_data[WAITING_EXTEND_ID] = True
             await update.message.reply_text("أرسل رقم ID للمشترك لتمديده +90 يوم (3 شهور).", reply_markup=kb_main())
+            return
+
+        if text == TXT_SYNC:
+            context.user_data[WAITING_SYNC] = True
+            await update.message.reply_text("أرسل رقم ID للعضو لمزامنة حالته مع الكروب (Active / Removed).", reply_markup=kb_main())
             return
 
         if text == TXT_WARN:
@@ -850,6 +838,7 @@ if context.user_data.get(WAITING_SYNC):
         return
 
 
+
 # =========================
 # تشغيل
 # =========================
@@ -879,6 +868,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
 
