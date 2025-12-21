@@ -199,6 +199,17 @@ def mark_member_left(user_id: int, left_at: datetime):
             """, (left_at, user_id))
         conn.commit()
 
+def mark_member_active(user_id: int):
+    """رجّع العضو Active بدون ما نغيّر joined/expires (فقط حالة)."""
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            UPDATE members
+            SET is_active=TRUE, left_at=NULL
+            WHERE user_id=%s
+            """, (user_id,))
+        conn.commit()
+
 
 def get_counts_active() -> int:
     with pool.connection() as conn:
@@ -323,6 +334,8 @@ async def owner_only(update: Update) -> bool:
 STATE_KEY = "ui_state"
 WAITING_SEARCH = "waiting_search"
 WAITING_EXTEND_ID = "waiting_extend_id"
+WAITING_SYNC = "waiting_sync"
+
 
 STATE_MAIN = "MAIN"
 STATE_GROUP = "GROUP"
@@ -334,11 +347,12 @@ def kb_main():
         [
             ["📊 عدد المشتركين", "🧾 تصدير Excel"],
             ["🔎 بحث عن مشترك", "➕ تمديد +90 يوم"],
-            ["🔔 فحص التنبيه الآن", "📣 إعدادات تنبيه الكروب"],
-            ["⏳ مدة الاشتراك الافتراضية"],
+            ["🔄 تحديث حالة عضو", "🔔 فحص التنبيه الآن"],
+            ["📣 إعدادات تنبيه الكروب", "⏳ مدة الاشتراك الافتراضية"],
         ],
         resize_keyboard=True
     )
+
 
 
 def kb_group():
@@ -385,6 +399,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data[STATE_KEY] = STATE_MAIN
     context.user_data[WAITING_SEARCH] = False
     context.user_data[WAITING_EXTEND_ID] = False
+    context.user_data[WAITING_SYNC] = False
 
     await update.message.reply_text("لوحة التحكم ✅", reply_markup=kb_main())
 
@@ -625,6 +640,7 @@ TXT_EXTEND = "➕ تمديد +90 يوم"
 TXT_WARN = "🔔 فحص التنبيه الآن"
 TXT_GROUP = "📣 إعدادات تنبيه الكروب"
 TXT_DURATION = "⏳ مدة الاشتراك الافتراضية"
+TXT_SYNC = "🔄 تحديث حالة عضو"
 
 TXT_TOGGLE_GROUP = "✅ تفعيل/إيقاف تنبيه الكروب"
 TXT_STAGE_7 = "مراحل التنبيه: 7 فقط"
@@ -641,6 +657,53 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
+    # ينتظر مزامنة حالة عضو (زر 🔄)
+if context.user_data.get(WAITING_SYNC):
+    context.user_data[WAITING_SYNC] = False
+
+    if not text.isdigit():
+        await update.message.reply_text("أرسل رقم ID فقط.", reply_markup=kb_main())
+        return
+
+    gid = get_setting("notify_group_chat_id", "").strip()
+    if not gid:
+        await update.message.reply_text(
+            "ما في كروب محفوظ. نفّذ /setgroup داخل الكروب أولًا.",
+            reply_markup=kb_main()
+        )
+        return
+
+    group_id = int(gid)
+    user_id = int(text)
+
+    try:
+        cm = await context.bot.get_chat_member(chat_id=group_id, user_id=user_id)
+        status = cm.status  # member / administrator / restricted / left / kicked
+
+        if status in ("left", "kicked"):
+            mark_member_left(user_id, datetime.now(timezone.utc))
+            await update.message.reply_text(
+                f"✅ تم ضبط العضو كـ Removed (status={status}).",
+                reply_markup=kb_main()
+            )
+        else:
+            mark_member_active(user_id)
+            await update.message.reply_text(
+                f"✅ تم ضبط العضو كـ Active (status={status}).",
+                reply_markup=kb_main()
+            )
+
+    except Exception as e:
+        await update.message.reply_text(
+            "تعذّر فحص العضو.\n"
+            "تأكد من:\n"
+            "- البوت Admin بالكروب\n"
+            "- نفذت /setgroup\n"
+            "- الـID صحيح",
+            reply_markup=kb_main()
+        )
+
+    return
 
     # ينتظر بحث
     if context.user_data.get(WAITING_SEARCH):
@@ -705,6 +768,14 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             bio.name = "subscribers.xlsx"
             await update.message.reply_document(document=InputFile(bio), caption="ملف Excel ✅", reply_markup=kb_main())
             return
+
+        if text == TXT_SYNC:
+    context.user_data[WAITING_SYNC] = True
+    await update.message.reply_text(
+        "أرسل رقم ID للعضو لمزامنة حالته مع الكروب (Active / Removed).",
+        reply_markup=kb_main()
+    )
+    return
 
         if text == TXT_SEARCH:
             context.user_data[WAITING_SEARCH] = True
@@ -792,6 +863,8 @@ def main():
 
     # تتبع دخول/خروج
     app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.CHAT_MEMBER))
+    app.add_handler(ChatMemberHandler(on_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+
 
     # فحص يومي
     app.job_queue.run_daily(
@@ -800,9 +873,10 @@ def main():
         name="daily_warning_check",
     )
 
-    app.run_polling(allowed_updates=["message", "chat_member"])
+    app.run_polling(allowed_updates=["message", "chat_member", "my_chat_member"])
 
 
 if __name__ == "__main__":
     main()
+
 
