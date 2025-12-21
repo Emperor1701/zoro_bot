@@ -770,12 +770,13 @@ if context.user_data.get(WAITING_SYNC):
             return
 
         if text == TXT_SYNC:
-    context.user_data[WAITING_SYNC] = True
-    await update.message.reply_text(
-        "أرسل رقم ID للعضو لمزامنة حالته مع الكروب (Active / Removed).",
-        reply_markup=kb_main()
-    )
-    return
+            context.user_data[WAITING_SYNC] = True
+            await update.message.reply_text(
+                "أرسل رقم ID للعضو لمزامنة حالته مع الكروب (Active / Removed).",
+                reply_markup=kb_main()
+            )
+            return
+
 
         if text == TXT_SEARCH:
             context.user_data[WAITING_SEARCH] = True
@@ -878,5 +879,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
