@@ -84,7 +84,7 @@ pool = ConnectionPool(conninfo=DATABASE_URL, min_size=1, max_size=5, open=True)
 def init_db():
     with pool.connection() as conn:
         with conn.cursor() as cur:
-            # members: أضفنا is_active + left_at
+            # إنشاء الجدول الأساسي إن لم يكن موجود
             cur.execute("""
             CREATE TABLE IF NOT EXISTS members (
                 user_id BIGINT PRIMARY KEY,
@@ -92,18 +92,19 @@ def init_db():
                 full_name TEXT,
                 joined_at TIMESTAMPTZ NOT NULL,
                 expires_at TIMESTAMPTZ NOT NULL,
-                warn_stage_sent INTEGER,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                left_at TIMESTAMPTZ NULL
+                warn_stage_sent INTEGER
             );
             """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_members_expires_at ON members (expires_at);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_members_active ON members (is_active);")
 
-            # لو كانت قاعدة قديمة بدون الأعمدة، نضيفها
+            # ⬅️ إضافة الأعمدة الجديدة بأمان (لو القاعدة قديمة)
             cur.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;")
             cur.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ NULL;")
 
+            # ⬅️ إنشاء الـ indexes بعد التأكد من وجود الأعمدة
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_members_expires_at ON members (expires_at);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_members_active ON members (is_active);")
+
+            # إعدادات البوت
             cur.execute("""
             CREATE TABLE IF NOT EXISTS settings (
                 key TEXT PRIMARY KEY,
@@ -119,7 +120,9 @@ def init_db():
                 ('group_notify_stages', '7')
             ON CONFLICT (key) DO NOTHING;
             """)
+
         conn.commit()
+
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -802,3 +805,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
