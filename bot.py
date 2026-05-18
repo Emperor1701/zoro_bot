@@ -100,11 +100,21 @@ def init_db():
             # ⬅️ إضافة الأعمدة الجديدة بأمان (لو القاعدة قديمة)
             cur.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;")
             cur.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS left_at TIMESTAMPTZ NULL;")
+            cur.execute("ALTER TABLE members ADD COLUMN IF NOT EXISTS grace_warning_sent BOOLEAN NOT NULL DEFAULT FALSE;")
 
             # ⬅️ إنشاء الـ indexes بعد التأكد من وجود الأعمدة
             cur.execute("CREATE INDEX IF NOT EXISTS idx_members_expires_at ON members (expires_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_members_active ON members (is_active);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_members_active_expires ON members (is_active, expires_at);")
+
+            # طلبات تأكيد الطرد المعلقة عند المالك
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS pending_kicks (
+                user_id BIGINT PRIMARY KEY,
+                requested_at TIMESTAMPTZ NOT NULL,
+                expires_at_snapshot TIMESTAMPTZ NOT NULL
+            );
+            """)
 
             # إعدادات البوت
             cur.execute("""
@@ -178,8 +188,8 @@ def upsert_member_join(user_id: int, username: str, full_name: str, joined_at: d
     with pool.connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-            INSERT INTO members(user_id, username, full_name, joined_at, expires_at, warn_stage_sent, is_active, left_at)
-            VALUES (%s, %s, %s, %s, %s, NULL, TRUE, NULL)
+            INSERT INTO members(user_id, username, full_name, joined_at, expires_at, warn_stage_sent, is_active, left_at, grace_warning_sent)
+            VALUES (%s, %s, %s, %s, %s, NULL, TRUE, NULL, FALSE)
             ON CONFLICT (user_id) DO UPDATE SET
                 username=EXCLUDED.username,
                 full_name=EXCLUDED.full_name,
@@ -187,7 +197,8 @@ def upsert_member_join(user_id: int, username: str, full_name: str, joined_at: d
                 expires_at=EXCLUDED.expires_at,
                 warn_stage_sent=NULL,
                 is_active=TRUE,
-                left_at=NULL
+                left_at=NULL,
+                grace_warning_sent=FALSE
             """, (user_id, username or "", full_name or "", joined_at, expires))
         conn.commit()
 
@@ -207,6 +218,7 @@ def mark_member_left(user_id: int, left_at: datetime):
             SET is_active=FALSE, left_at=%s
             WHERE user_id=%s
             """, (left_at, user_id))
+            cur.execute("DELETE FROM pending_kicks WHERE user_id=%s", (user_id,))
         conn.commit()
 
 def mark_member_active(user_id: int):
@@ -324,12 +336,62 @@ def extend_member_days(user_id: int, days: int) -> bool:
             new_exp = old_exp + timedelta(days=days)
             cur.execute("""
             UPDATE members
-            SET expires_at=%s, warn_stage_sent=NULL
+            SET expires_at=%s, warn_stage_sent=NULL, grace_warning_sent=FALSE
             WHERE user_id=%s
             """, (new_exp, user_id))
+            cur.execute("DELETE FROM pending_kicks WHERE user_id=%s", (user_id,))
         conn.commit()
     return True
 
+
+
+def set_grace_warning_sent(user_id: int):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE members SET grace_warning_sent=TRUE WHERE user_id=%s", (user_id,))
+        conn.commit()
+
+
+def upsert_pending_kick(user_id: int, expires_at: datetime):
+    expires_at = ensure_aware_utc(expires_at)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            INSERT INTO pending_kicks(user_id, requested_at, expires_at_snapshot)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (user_id) DO UPDATE SET
+                requested_at=EXCLUDED.requested_at,
+                expires_at_snapshot=EXCLUDED.expires_at_snapshot
+            """, (user_id, datetime.now(timezone.utc), expires_at))
+        conn.commit()
+
+
+def delete_pending_kick(user_id: int):
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM pending_kicks WHERE user_id=%s", (user_id,))
+        conn.commit()
+
+
+def pending_kick_exists(user_id: int) -> bool:
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM pending_kicks WHERE user_id=%s", (user_id,))
+            return cur.fetchone() is not None
+
+
+def is_member_past_grace(user_id: int, now: datetime | None = None) -> tuple[bool, tuple | None]:
+    now = ensure_aware_utc(now or datetime.now(timezone.utc))
+    cutoff = now - timedelta(days=GRACE_PERIOD_DAYS)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent, is_active, left_at
+            FROM members
+            WHERE user_id=%s AND is_active=TRUE AND expires_at <= %s
+            """, (user_id, cutoff))
+            row = cur.fetchone()
+            return (row is not None), row
 
 def set_warn_stage(user_id: int, stage: int | None):
     with pool.connection() as conn:
@@ -656,6 +718,60 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
 
 
 
+async def notify_expired_grace_started(context: ContextTypes.DEFAULT_TYPE):
+    """أرسل رسالة بالكروب مرة واحدة عند بداية مهلة السماح بعد انتهاء الاشتراك."""
+    gid = get_setting("notify_group_chat_id", "").strip()
+    if not gid:
+        return
+
+    group_id = int(gid)
+    now = datetime.now(timezone.utc)
+    expired_in_grace = fetch_active_expired(now)
+
+    notified_ids = []
+    lines = [
+        "⚠️ انتهى اشتراك الطلاب التالية أسماؤهم.",
+        "",
+        f"لديكم مهلة {GRACE_PERIOD_DAYS} أيام لتجديد الاشتراك قبل الإزالة من الكروب.",
+        f"للتجديد يرجى مراسلة الكينغ: {KING_USERNAME}",
+        "",
+    ]
+
+    for user_id, username, full_name, _joined_at, expires_at, _warn_stage, _is_active, _left_at in expired_in_grace:
+        expires_at = ensure_aware_utc(expires_at)
+        grace_ends = expires_at + timedelta(days=GRACE_PERIOD_DAYS)
+
+        # إذا خلصت المهلة، لا نرسل رسالة السماح؛ طلب التأكيد/الطرد يتكفل فيه
+        if now >= grace_ends:
+            continue
+
+        # لا نكرر الرسالة لنفس العضو كل يوم
+        with pool.connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT grace_warning_sent FROM members WHERE user_id=%s", (user_id,))
+                row = cur.fetchone()
+                if row and row[0] is True:
+                    continue
+
+        display = full_name if full_name else str(user_id)
+        mention = mention_html(user_id, display)
+        lines.append(f"• {mention} | آخر موعد للتجديد: {fmt_local(grace_ends)}")
+        notified_ids.append(user_id)
+
+    if not notified_ids:
+        return
+
+    await context.bot.send_message(
+        chat_id=group_id,
+        text="\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+    )
+
+    for user_id in notified_ids:
+        set_grace_warning_sent(user_id)
+
+
 async def kick_member_after_grace(context: ContextTypes.DEFAULT_TYPE, group_id: int, row) -> tuple[bool, str]:
     user_id, username, full_name, _joined_at, expires_at, _warn_stage, _is_active, _left_at = row
     display_name = full_name or (f"@{username}" if username else str(user_id))
@@ -664,21 +780,54 @@ async def kick_member_after_grace(context: ContextTypes.DEFAULT_TYPE, group_id: 
         cm = await context.bot.get_chat_member(chat_id=group_id, user_id=user_id)
         if cm.status in ("left", "kicked"):
             mark_member_left(user_id, datetime.now(timezone.utc))
+            delete_pending_kick(user_id)
             return True, f"- {display_name} | ID: {user_id} | كان خارج الكروب بالفعل وتم ضبطه Removed"
 
         if cm.status in ("administrator", "creator"):
+            delete_pending_kick(user_id)
             return False, f"- {display_name} | ID: {user_id} | لم يتم طرده لأنه Admin/Owner"
 
         # ban + unban = طرد فقط بدون حظر دائم
         await context.bot.ban_chat_member(chat_id=group_id, user_id=user_id)
         await context.bot.unban_chat_member(chat_id=group_id, user_id=user_id, only_if_banned=True)
         mark_member_left(user_id, datetime.now(timezone.utc))
+        delete_pending_kick(user_id)
 
         grace_ended = ensure_aware_utc(expires_at) + timedelta(days=GRACE_PERIOD_DAYS)
         return True, f"- {display_name} | ID: {user_id} | انتهت المهلة: {fmt_local(grace_ended)}"
 
     except Exception as e:
         return False, f"- {display_name} | ID: {user_id} | فشل الطرد: {type(e).__name__}"
+
+
+async def request_kick_confirmation(context: ContextTypes.DEFAULT_TYPE, row) -> bool:
+    """يرسل للمالك طلب تأكيد طرد. يرجع True إذا أرسل طلب جديد."""
+    user_id, username, full_name, _joined_at, expires_at, _warn_stage, _is_active, _left_at = row
+    if pending_kick_exists(user_id):
+        return False
+
+    display_name = full_name or (f"@{username}" if username else str(user_id))
+    grace_ended = ensure_aware_utc(expires_at) + timedelta(days=GRACE_PERIOD_DAYS)
+
+    upsert_pending_kick(user_id, expires_at)
+
+    confirm_text = f"{TXT_CONFIRM_KICK_PREFIX} {user_id}"
+    cancel_text = f"{TXT_CANCEL_KICK_PREFIX} {user_id}"
+    kb = ReplyKeyboardMarkup([[confirm_text], [cancel_text], [TXT_BACK]], resize_keyboard=True)
+
+    await context.bot.send_message(
+        chat_id=OWNER_ID,
+        text=(
+            "🚫 الطالب تجاوز مهلة السماح ويحتاج تأكيد الطرد:\n\n"
+            f"- الاسم: {display_name}\n"
+            f"- ID: {user_id}\n"
+            f"- انتهى الاشتراك: {fmt_local(expires_at)} ({LOCAL_TIMEZONE})\n"
+            f"- انتهت المهلة: {fmt_local(grace_ended)} ({LOCAL_TIMEZONE})\n\n"
+            "اضغط تأكيد الطرد ليتم طرده من الكروب، أو إلغاء الطرد لإزالة الطلب."
+        ),
+        reply_markup=kb,
+    )
+    return True
 
 
 async def run_grace_kick_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
@@ -691,7 +840,6 @@ async def run_grace_kick_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
             )
         return
 
-    group_id = int(gid)
     now = datetime.now(timezone.utc)
     expired_after_grace = fetch_active_past_grace(now, GRACE_PERIOD_DAYS)
 
@@ -700,35 +848,29 @@ async def run_grace_kick_check(context: ContextTypes.DEFAULT_TYPE, manual: bool 
             await context.bot.send_message(chat_id=OWNER_ID, text="✅ لا يوجد أعضاء تجاوزوا مهلة السماح الآن.")
         return
 
-    success_lines = []
-    failed_lines = []
-
+    sent_count = 0
+    skipped_count = 0
     for row in expired_after_grace:
-        ok, line = await kick_member_after_grace(context, group_id, row)
-        if ok:
-            success_lines.append(line)
+        sent = await request_kick_confirmation(context, row)
+        if sent:
+            sent_count += 1
         else:
-            failed_lines.append(line)
+            skipped_count += 1
 
-    lines = [f"🚫 فحص إزالة المنتهية اشتراكاتهم بعد مهلة {GRACE_PERIOD_DAYS} أيام", ""]
-    if success_lines:
-        lines.append("تمت الإزالة / التحديث:")
-        lines.extend(success_lines[:80])
-        if len(success_lines) > 80:
-            lines.append(f"… ويوجد {len(success_lines) - 80} آخرين.")
-
-    if failed_lines:
-        if success_lines:
-            lines.append("")
-        lines.append("لم تتم إزالة هؤلاء:")
-        lines.extend(failed_lines[:80])
-        if len(failed_lines) > 80:
-            lines.append(f"… ويوجد {len(failed_lines) - 80} آخرين.")
-
-    await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+    if manual:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=(
+                f"✅ تم فحص الطرد بعد مهلة {GRACE_PERIOD_DAYS} أيام.\n"
+                f"طلبات تأكيد جديدة: {sent_count}\n"
+                f"طلبات كانت معلقة مسبقًا: {skipped_count}"
+            ),
+            reply_markup=kb_main(),
+        )
 
 async def job_daily_warning(context: ContextTypes.DEFAULT_TYPE):
     await run_warning_check(context, manual=False)
+    await notify_expired_grace_started(context)
     await run_grace_kick_check(context, manual=False)
 
 
@@ -750,6 +892,8 @@ TXT_STAGE_7 = "مراحل التنبيه: 7 فقط"
 TXT_STAGE_ALL = "مراحل التنبيه: 7+3+1"
 TXT_HOW_SETGROUP = "📌 شرح setgroup"
 TXT_BACK = "⬅️ رجوع للقائمة الرئيسية"
+TXT_CONFIRM_KICK_PREFIX = "✅ تأكيد الطرد:"
+TXT_CANCEL_KICK_PREFIX = "❌ إلغاء الطرد:"
 
 
 # =========================
@@ -760,6 +904,39 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     text = (update.message.text or "").strip()
+
+    # تأكيد أو إلغاء الطرد بعد انتهاء مهلة السماح
+    if text.startswith(TXT_CONFIRM_KICK_PREFIX):
+        raw_id = text.replace(TXT_CONFIRM_KICK_PREFIX, "", 1).strip()
+        if not raw_id.isdigit():
+            await update.message.reply_text("رقم ID غير صحيح.", reply_markup=kb_main())
+            return
+
+        user_id = int(raw_id)
+        gid = get_setting("notify_group_chat_id", "").strip()
+        if not gid:
+            await update.message.reply_text("ما في كروب محفوظ. نفّذ /setgroup داخل الكروب أولًا.", reply_markup=kb_main())
+            return
+
+        eligible, row = is_member_past_grace(user_id)
+        if not eligible or not row:
+            delete_pending_kick(user_id)
+            await update.message.reply_text(
+                "✅ لم يتم الطرد؛ العضو لم يعد متجاوزًا للمهلة، غالبًا تم تمديده أو تغيّرت حالته.",
+                reply_markup=kb_main()
+            )
+            return
+
+        ok, line = await kick_member_after_grace(context, int(gid), row)
+        await update.message.reply_text(("✅ تم تنفيذ الطرد/التحديث:\n" if ok else "⚠️ لم يتم الطرد:\n") + line, reply_markup=kb_main())
+        return
+
+    if text.startswith(TXT_CANCEL_KICK_PREFIX):
+        raw_id = text.replace(TXT_CANCEL_KICK_PREFIX, "", 1).strip()
+        if raw_id.isdigit():
+            delete_pending_kick(int(raw_id))
+        await update.message.reply_text("✅ تم إلغاء طلب الطرد.", reply_markup=kb_main())
+        return
 
     # ينتظر بحث
     if context.user_data.get(WAITING_SEARCH):
@@ -887,7 +1064,6 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == TXT_KICK_GRACE:
             await run_grace_kick_check(context, manual=True)
-            await update.message.reply_text("✅ تم فحص الطرد بعد المهلة الآن.", reply_markup=kb_main())
             return
 
         if text == TXT_GROUP:
