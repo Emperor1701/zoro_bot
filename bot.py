@@ -133,7 +133,7 @@ def init_db():
             ON CONFLICT (key) DO NOTHING;
             """)
 
-            # لو قاعدة البيانات قديمة وكانت مدة الاشتراك الافتراضية 3 شهور،
+            # لو قاعدة البيانات قديمة وكانت مدة الاشتراك الافتراضية شهرين،
             # غيّرها تلقائيًا إلى شهرين بدون ما يمس باقي الإعدادات.
             cur.execute("""
             UPDATE settings
@@ -434,10 +434,11 @@ def kb_main():
     return ReplyKeyboardMarkup(
         [
             ["📊 عدد المشتركين", "🧾 تصدير Excel"],
-            ["🔎 بحث عن مشترك", "➕ تمديد +90 يوم"],
+            ["🔎 بحث عن مشترك", "➕ تمديد +60 يوم"],
             ["🔄 تحديث حالة عضو", "🔔 فحص التنبيه الآن"],
             ["🚫 فحص الطرد بعد المهلة"],
             ["📣 إعدادات تنبيه الكروب", "⏳ مدة الاشتراك الافتراضية"],
+            ["🏠 العودة للبداية"],
         ],
         resize_keyboard=True
     )
@@ -450,7 +451,7 @@ def kb_group():
             ["✅ تفعيل/إيقاف تنبيه الكروب"],
             ["مراحل التنبيه: 7 فقط", "مراحل التنبيه: 7+3+1"],
             ["📌 شرح setgroup"],
-            ["⬅️ رجوع للقائمة الرئيسية"],
+            ["⬅️ رجوع للخلف", "🏠 العودة للبداية"],
         ],
         resize_keyboard=True
     )
@@ -460,7 +461,7 @@ def kb_duration():
     return ReplyKeyboardMarkup(
         [
             ["1 شهر", "2 شهور", "12 شهر"],
-            ["⬅️ رجوع للقائمة الرئيسية"],
+            ["⬅️ رجوع للخلف", "🏠 العودة للبداية"],
         ],
         resize_keyboard=True
     )
@@ -880,7 +881,7 @@ async def job_daily_warning(context: ContextTypes.DEFAULT_TYPE):
 TXT_COUNT = "📊 عدد المشتركين"
 TXT_EXPORT = "🧾 تصدير Excel"
 TXT_SEARCH = "🔎 بحث عن مشترك"
-TXT_EXTEND = "➕ تمديد +90 يوم"
+TXT_EXTEND = "➕ تمديد +60 يوم"
 TXT_WARN = "🔔 فحص التنبيه الآن"
 TXT_KICK_GRACE = "🚫 فحص الطرد بعد المهلة"
 TXT_GROUP = "📣 إعدادات تنبيه الكروب"
@@ -891,7 +892,8 @@ TXT_TOGGLE_GROUP = "✅ تفعيل/إيقاف تنبيه الكروب"
 TXT_STAGE_7 = "مراحل التنبيه: 7 فقط"
 TXT_STAGE_ALL = "مراحل التنبيه: 7+3+1"
 TXT_HOW_SETGROUP = "📌 شرح setgroup"
-TXT_BACK = "⬅️ رجوع للقائمة الرئيسية"
+TXT_BACK = "⬅️ رجوع للخلف"
+TXT_HOME = "🏠 العودة للبداية"
 TXT_CONFIRM_KICK_PREFIX = "✅ تأكيد الطرد:"
 TXT_CANCEL_KICK_PREFIX = "❌ إلغاء الطرد:"
 
@@ -970,11 +972,11 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not text.isdigit():
             await update.message.reply_text("أرسل رقم ID فقط.", reply_markup=kb_main())
             return
-        ok = extend_member_days(int(text), 90)
+        ok = extend_member_days(int(text), 60)
         if not ok:
             await update.message.reply_text("هذا الـID غير موجود في قاعدة البيانات.", reply_markup=kb_main())
             return
-        await update.message.reply_text("✅ تم التمديد +90 يوم (3 شهور).", reply_markup=kb_main())
+        await update.message.reply_text("✅ تم التمديد +60 يوم (شهرين).", reply_markup=kb_main())
         return
 
     # ينتظر مزامنة حالة عضو
@@ -1018,10 +1020,22 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     state = context.user_data.get(STATE_KEY, STATE_MAIN)
 
-    # رجوع
-    if text == TXT_BACK:
+    # تنقّل
+    if text == TXT_HOME:
         context.user_data[STATE_KEY] = STATE_MAIN
-        await update.message.reply_text("✅ رجعنا للقائمة الرئيسية", reply_markup=kb_main())
+        context.user_data[WAITING_SEARCH] = False
+        context.user_data[WAITING_EXTEND_ID] = False
+        context.user_data[WAITING_SYNC] = False
+        await update.message.reply_text("🏠 رجعنا للبداية", reply_markup=kb_main())
+        return
+
+    if text == TXT_BACK:
+        # حاليًا الصفحات الفرعية ترجع للقائمة الرئيسية
+        context.user_data[STATE_KEY] = STATE_MAIN
+        context.user_data[WAITING_SEARCH] = False
+        context.user_data[WAITING_EXTEND_ID] = False
+        context.user_data[WAITING_SYNC] = False
+        await update.message.reply_text("⬅️ رجعنا خطوة للخلف", reply_markup=kb_main())
         return
 
     # MAIN
@@ -1049,7 +1063,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == TXT_EXTEND:
             context.user_data[WAITING_EXTEND_ID] = True
-            await update.message.reply_text("أرسل رقم ID للمشترك لتمديده +90 يوم (3 شهور).", reply_markup=kb_main())
+            await update.message.reply_text("أرسل رقم ID للمشترك لتمديده +60 يوم (شهرين).", reply_markup=kb_main())
             return
 
         if text == TXT_SYNC:
