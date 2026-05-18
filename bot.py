@@ -36,6 +36,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DAILY_CHECK_HOUR_UTC = int(os.getenv("DAILY_CHECK_HOUR_UTC", "9"))
 WARN_STAGES_OWNER = [7, 3, 1]
 GROUP_MENTION_CHUNK_SIZE = 30
+GRACE_PERIOD_DAYS = int(os.getenv("GRACE_PERIOD_DAYS", "5"))
 
 KING_USERNAME = "@Alking03"
 LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "UTC").strip()
@@ -103,6 +104,7 @@ def init_db():
             # ⬅️ إنشاء الـ indexes بعد التأكد من وجود الأعمدة
             cur.execute("CREATE INDEX IF NOT EXISTS idx_members_expires_at ON members (expires_at);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_members_active ON members (is_active);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_members_active_expires ON members (is_active, expires_at);")
 
             # إعدادات البوت
             cur.execute("""
@@ -114,11 +116,19 @@ def init_db():
 
             cur.execute("""
             INSERT INTO settings(key, value) VALUES
-                ('default_duration_months', '3'),
+                ('default_duration_months', '2'),
                 ('notify_group_chat_id', ''),
                 ('group_notify_enabled', '0'),
                 ('group_notify_stages', '7')
             ON CONFLICT (key) DO NOTHING;
+            """)
+
+            # لو قاعدة البيانات قديمة وكانت مدة الاشتراك الافتراضية 3 شهور،
+            # غيّرها تلقائيًا إلى شهرين بدون ما يمس باقي الإعدادات.
+            cur.execute("""
+            UPDATE settings
+            SET value='2'
+            WHERE key='default_duration_months' AND value='3';
             """)
 
         conn.commit()
@@ -145,9 +155,9 @@ def set_setting(key: str, value: str):
 
 def get_default_months() -> int:
     try:
-        return int(get_setting("default_duration_months", "3"))
+        return int(get_setting("default_duration_months", "2"))
     except Exception:
-        return 3
+        return 2
 
 
 def compute_expiry(joined_at: datetime) -> datetime:
@@ -255,6 +265,22 @@ def fetch_active_expired(now: datetime):
             return cur.fetchall()
 
 
+
+
+def fetch_active_past_grace(now: datetime, grace_days: int = GRACE_PERIOD_DAYS):
+    """الأعضاء الـ Active الذين انتهت مهلة السماح الخاصة بهم ويجب إزالتهم من الكروب."""
+    now = ensure_aware_utc(now)
+    cutoff = now - timedelta(days=grace_days)
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            SELECT user_id, username, full_name, joined_at, expires_at, warn_stage_sent, is_active, left_at
+            FROM members
+            WHERE is_active=TRUE AND expires_at <= %s
+            ORDER BY expires_at ASC
+            """, (cutoff,))
+            return cur.fetchall()
+
 def fetch_active_expiring_within(now: datetime, days: int):
     now = ensure_aware_utc(now)
     end = now + timedelta(days=days)
@@ -348,6 +374,7 @@ def kb_main():
             ["📊 عدد المشتركين", "🧾 تصدير Excel"],
             ["🔎 بحث عن مشترك", "➕ تمديد +90 يوم"],
             ["🔄 تحديث حالة عضو", "🔔 فحص التنبيه الآن"],
+            ["🚫 فحص الطرد بعد المهلة"],
             ["📣 إعدادات تنبيه الكروب", "⏳ مدة الاشتراك الافتراضية"],
         ],
         resize_keyboard=True
@@ -432,7 +459,8 @@ async def on_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not cmu:
         return
 
-    user = cmu.from_user
+    # العضو المتأثر بالحدث، وليس الشخص الذي قام بتنفيذ الحدث
+    user = cmu.new_chat_member.user
     new_status = cmu.new_chat_member.status
     old_status = cmu.old_chat_member.status
 
@@ -626,8 +654,82 @@ async def run_warning_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = F
         await context.bot.send_message(chat_id=OWNER_ID, text="✅ لا يوجد تنبيهات الآن.")
 
 
+
+
+async def kick_member_after_grace(context: ContextTypes.DEFAULT_TYPE, group_id: int, row) -> tuple[bool, str]:
+    user_id, username, full_name, _joined_at, expires_at, _warn_stage, _is_active, _left_at = row
+    display_name = full_name or (f"@{username}" if username else str(user_id))
+
+    try:
+        cm = await context.bot.get_chat_member(chat_id=group_id, user_id=user_id)
+        if cm.status in ("left", "kicked"):
+            mark_member_left(user_id, datetime.now(timezone.utc))
+            return True, f"- {display_name} | ID: {user_id} | كان خارج الكروب بالفعل وتم ضبطه Removed"
+
+        if cm.status in ("administrator", "creator"):
+            return False, f"- {display_name} | ID: {user_id} | لم يتم طرده لأنه Admin/Owner"
+
+        # ban + unban = طرد فقط بدون حظر دائم
+        await context.bot.ban_chat_member(chat_id=group_id, user_id=user_id)
+        await context.bot.unban_chat_member(chat_id=group_id, user_id=user_id, only_if_banned=True)
+        mark_member_left(user_id, datetime.now(timezone.utc))
+
+        grace_ended = ensure_aware_utc(expires_at) + timedelta(days=GRACE_PERIOD_DAYS)
+        return True, f"- {display_name} | ID: {user_id} | انتهت المهلة: {fmt_local(grace_ended)}"
+
+    except Exception as e:
+        return False, f"- {display_name} | ID: {user_id} | فشل الطرد: {type(e).__name__}"
+
+
+async def run_grace_kick_check(context: ContextTypes.DEFAULT_TYPE, manual: bool = False):
+    gid = get_setting("notify_group_chat_id", "").strip()
+    if not gid:
+        if manual:
+            await context.bot.send_message(
+                chat_id=OWNER_ID,
+                text="ما في كروب محفوظ للطرد. نفّذ /setgroup داخل الكروب أولًا."
+            )
+        return
+
+    group_id = int(gid)
+    now = datetime.now(timezone.utc)
+    expired_after_grace = fetch_active_past_grace(now, GRACE_PERIOD_DAYS)
+
+    if not expired_after_grace:
+        if manual:
+            await context.bot.send_message(chat_id=OWNER_ID, text="✅ لا يوجد أعضاء تجاوزوا مهلة السماح الآن.")
+        return
+
+    success_lines = []
+    failed_lines = []
+
+    for row in expired_after_grace:
+        ok, line = await kick_member_after_grace(context, group_id, row)
+        if ok:
+            success_lines.append(line)
+        else:
+            failed_lines.append(line)
+
+    lines = [f"🚫 فحص إزالة المنتهية اشتراكاتهم بعد مهلة {GRACE_PERIOD_DAYS} أيام", ""]
+    if success_lines:
+        lines.append("تمت الإزالة / التحديث:")
+        lines.extend(success_lines[:80])
+        if len(success_lines) > 80:
+            lines.append(f"… ويوجد {len(success_lines) - 80} آخرين.")
+
+    if failed_lines:
+        if success_lines:
+            lines.append("")
+        lines.append("لم تتم إزالة هؤلاء:")
+        lines.extend(failed_lines[:80])
+        if len(failed_lines) > 80:
+            lines.append(f"… ويوجد {len(failed_lines) - 80} آخرين.")
+
+    await context.bot.send_message(chat_id=OWNER_ID, text="\n".join(lines))
+
 async def job_daily_warning(context: ContextTypes.DEFAULT_TYPE):
     await run_warning_check(context, manual=False)
+    await run_grace_kick_check(context, manual=False)
 
 
 # =========================
@@ -638,6 +740,7 @@ TXT_EXPORT = "🧾 تصدير Excel"
 TXT_SEARCH = "🔎 بحث عن مشترك"
 TXT_EXTEND = "➕ تمديد +90 يوم"
 TXT_WARN = "🔔 فحص التنبيه الآن"
+TXT_KICK_GRACE = "🚫 فحص الطرد بعد المهلة"
 TXT_GROUP = "📣 إعدادات تنبيه الكروب"
 TXT_DURATION = "⏳ مدة الاشتراك الافتراضية"
 TXT_SYNC = "🔄 تحديث حالة عضو"
@@ -677,6 +780,7 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"- Status: {status}\n"
             f"- Joined: {fmt_local(joined_at)} ({LOCAL_TIMEZONE})\n"
             f"- Expires: {fmt_local(expires_at)} ({LOCAL_TIMEZONE})\n"
+            f"- Grace ends: {fmt_local(ensure_aware_utc(expires_at) + timedelta(days=GRACE_PERIOD_DAYS))} ({LOCAL_TIMEZONE})\n"
             f"- Left at: {(fmt_local(left_at) if left_at else '-')}\n"
             f"- Warn stage sent: {warn_stage if warn_stage is not None else 'None'}"
         )
@@ -781,6 +885,11 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("✅ تم فحص التنبيهات الآن.", reply_markup=kb_main())
             return
 
+        if text == TXT_KICK_GRACE:
+            await run_grace_kick_check(context, manual=True)
+            await update.message.reply_text("✅ تم فحص الطرد بعد المهلة الآن.", reply_markup=kb_main())
+            return
+
         if text == TXT_GROUP:
             context.user_data[STATE_KEY] = STATE_GROUP
             await update.message.reply_text(group_status_text(), reply_markup=kb_group())
@@ -827,8 +936,8 @@ async def on_private_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # DURATION
     if state == STATE_DURATION:
-        if text in ("1 شهر", "3 شهور", "12 شهر"):
-            months = {"1 شهر": "1", "3 شهور": "3", "12 شهر": "12"}[text]
+        if text in ("1 شهر", "2 شهور", "12 شهر"):
+            months = {"1 شهر": "1", "2 شهور": "2", "12 شهر": "12"}[text]
             set_setting("default_duration_months", months)
             context.user_data[STATE_KEY] = STATE_MAIN
             await update.message.reply_text(f"✅ تم ضبط المدة الافتراضية إلى: {months} شهر", reply_markup=kb_main())
