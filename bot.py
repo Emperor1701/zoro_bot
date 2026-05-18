@@ -37,7 +37,7 @@ DAILY_CHECK_HOUR_UTC = int(os.getenv("DAILY_CHECK_HOUR_UTC", "9"))
 WARN_STAGES_OWNER = [7, 3, 1]
 GROUP_MENTION_CHUNK_SIZE = 30
 
-KING_USERNAME = "@Al_K_i_n_g"
+KING_USERNAME = "@Alking03"
 LOCAL_TIMEZONE = os.getenv("LOCAL_TIMEZONE", "UTC").strip()
 
 if not BOT_TOKEN or OWNER_ID == 0 or not DATABASE_URL:
@@ -370,7 +370,7 @@ def kb_group():
 def kb_duration():
     return ReplyKeyboardMarkup(
         [
-            ["1 شهر", "3 شهور", "12 شهر"],
+            ["1 شهر", "2 شهور", "12 شهر"],
             ["⬅️ رجوع للقائمة الرئيسية"],
         ],
         resize_keyboard=True
